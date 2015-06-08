@@ -28,6 +28,7 @@ from koji.context import context
 from koji.plugin import export
 
 koji_hub_path = '/usr/share/koji-hub/'
+koji_hub_path = '/opt/koji/koji-hub/'
 sys.path.insert(0, koji_hub_path)
 import kojihub
 

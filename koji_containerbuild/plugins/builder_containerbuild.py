@@ -48,6 +48,7 @@ from osbs.conf import Configuration
 # We need kojid module which isn't proper python module and not even in
 # site-package path.
 kojid_exe_path = '/usr/sbin/kojid'
+kojid_exe_path = '/opt/koji/builder/kojid'
 fo = file(kojid_exe_path, 'U')
 try:
     kojid = imp.load_module('kojid', fo, fo.name, ('.py', 'U', 1))
@@ -71,7 +72,6 @@ LABEL_MAP = {
 class ContainerError(koji.GenericError):
     """Raised when container creation fails"""
     faultCode = 2001
-
 
 # TODO: push this to upstream koji
 class My_SCM(SCM):
