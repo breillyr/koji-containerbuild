@@ -1,8 +1,15 @@
 from setuptools import setup
+from setuptools.command.sdist import sdist
+import subprocess
+
+
+class TitoDist(sdist):
+    def run(self):
+        subprocess.call(["tito", "build", "--tgz", "-o", "."])
 
 setup(
     name="koji-containerbuild",
-    version="0.5.1",
+    version="0.5.5",
     author="Pavol Babincak",
     author_email="pbabinca@redhat.com",
     description="Container build support for Koji buildsystem",
@@ -24,4 +31,7 @@ setup(
         "License :: OSI Approved :: GNU Lesser General Public License v2"
         " or later (LGPLv2+)",
     ],
+    cmdclass={
+        'sdist': TitoDist,
+    }
 )

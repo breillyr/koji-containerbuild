@@ -24,15 +24,15 @@ containers."""
 #       Pavol Babincak <pbabinca@redhat.com>
 import os
 import os.path
+import sys
 import logging
 import imp
-import shlex
+import time
+import traceback
 import urlgrabber
-from sys import version_info
-# from python-six
-PY2 = version_info[0] == 2
-
-DOCKERFILE_FILENAME = 'Dockerfile'
+import urlgrabber.grabber
+import dockerfile_parse
+import pycurl
 
 import koji
 from koji.daemon import SCM
@@ -56,16 +56,42 @@ finally:
     fo.close()
 
 
-# List of LABELs to fetch from Dockerfile
-LABELS = ('Name', 'Version', 'Release', 'Architecture')
+
+# List of LABEL identifiers used within Koji. Values doesn't need to correspond
+# to actual LABEL names. All these are required unless there exist default
+# value (see LABEL_DEFAULT_VALUES).
+LABELS = koji.Enum((
+    'COMPONENT',
+    'VERSION',
+    'RELEASE',
+    'ARCHITECTURE',
+))
+
+
+# Mapping between LABEL identifiers within koji and actual LABEL identifiers
+# which can be found in Dockerfile. First value is preferred one, others are for
+# compatibility purposes.
+LABEL_NAME_MAP = {
+    'COMPONENT': ('com.redhat.component', 'BZComponent'),
+    'VERSION': ('version', 'Version'),
+    'RELEASE': ('release', 'Release'),
+    'ARCHITECTURE': ('architecture', 'Architecture'),
+}
 
 
 # Map from LABELS to extra data
-LABEL_MAP = {
-    'Name': 'name',
-    'Version': 'version',
-    'Release': 'release',
-    'Architecture': 'architecture',
+LABEL_DATA_MAP = {
+    'COMPONENT': 'name',
+    'VERSION': 'version',
+    'RELEASE': 'release',
+    'ARCHITECTURE': 'architecture',
+}
+
+
+# Default values for LABELs. If there exist default value here LABEL is
+# optional in Dockerfile.
+LABEL_DEFAULT_VALUES = {
+    'ARCHITECTURE': 'x86_64',
 }
 
 
@@ -91,6 +117,133 @@ class My_SCM(SCM):
         return git_uri
 
 
+class FileWatcher(object):
+    """Watch directory for new or changed files which can be iterated on
+
+    Rewritten mock() from Buildroot class of kojid. When modifying keep that in
+    mind and after the API looks stable enough try to merge the code back to
+    koji.
+    """
+    def __init__(self, result_dir, logger):
+        self._result_dir = result_dir
+        self.logger = logger
+        self._logs = {}
+
+    def _list_files(self):
+        try:
+            results = os.listdir(self._result_dir)
+        except OSError:
+            # will happen when mock hasn't created the resultdir yet
+            return
+
+        for fname in results:
+            if fname.endswith('.log') and fname not in self._logs:
+                fpath = os.path.join(self._result_dir, fname)
+                self._logs[fname] = (None, None, 0, fpath)
+
+    def _reopen_file(self, fname, fd, inode, size, fpath):
+        try:
+            stat_info = os.stat(fpath)
+            if not fd or stat_info.st_ino != inode or stat_info.st_size < size:
+                # either a file we haven't opened before, or mock replaced a file we had open with
+                # a new file and is writing to it, or truncated the file we're reading,
+                # but our fd is pointing to the previous location in the old file
+                if fd:
+                    self.logger.info('Rereading %s, inode: %s -> %s, size: %s -> %s' %
+                                     (fpath, inode, stat_info.st_ino, size, stat_info.st_size))
+                    fd.close()
+                fd = file(fpath, 'r')
+            self._logs[fname] = (fd, stat_info.st_ino, stat_info.st_size, fpath)
+        except:
+            self.logger.error("Error reading mock log: %s", fpath)
+            self.logger.error(''.join(traceback.format_exception(*sys.exc_info())))
+            return False
+        return fd
+
+    def files_to_upload(self):
+        self._list_files()
+
+        for (fname, (fd, inode, size, fpath)) in self._logs.items():
+            fd = self._reopen_file(fname, fd, inode, size, fpath)
+            if fd is False:
+                return
+            yield (fd, fname)
+
+    def clean(self):
+        for (fname, (fd, inode, size, fpath)) in self._logs.items():
+            if fd:
+                fd.close()
+
+
+class LabelsWrapper(object):
+    def __init__(self, dockerfile_path, logger_name=None):
+        self.dockerfile_path = dockerfile_path
+        self._setup_logger(logger_name)
+        self._parser = None
+        self._label_data = {}
+
+    def _setup_logger(self, logger_name=None):
+        if logger_name:
+            dockerfile_parse.parser.logger = logging.getLogger("%s.dockerfile_parse"
+                                                               % logger_name)
+
+    def _parse(self):
+        self._parser = dockerfile_parse.parser.DockerfileParser(self.dockerfile_path)
+
+    def get_labels(self):
+        """returns all labels how they are found in Dockerfile"""
+        self._parse()
+        return self._parser.labels
+
+    def get_data_labels(self):
+        """Subset of labels found in Dockerfile which we are interested in
+
+        returns dict with keys from LABELS and default values from
+        LABEL_DEFAULT_VALUES or actual values from Dockefile as mapped via
+        LABEL_NAME_MAP.
+        """
+
+        parsed_labels = self.get_labels()
+        for label_id in LABELS:
+            assert label_id in LABEL_NAME_MAP, ("Required LABEL doesn't map "
+                                                "to LABEL name in Dockerfile")
+            self._label_data.setdefault(label_id,
+                                        LABEL_DEFAULT_VALUES.get(label_id,
+                                                                 None))
+            for label_name in LABEL_NAME_MAP[label_id]:
+                if label_name in parsed_labels:
+                    self._label_data[label_id] = parsed_labels[label_name]
+                    break
+        return self._label_data
+
+    def get_extra_data(self):
+        """Returns dict with keys for Koji's extra_information"""
+        data = self.get_data_labels()
+        extra_data = {}
+        for label_id, value in data.items():
+            assert label_id in LABEL_DATA_MAP
+            extra_key = LABEL_DATA_MAP[label_id]
+            extra_data[extra_key] = value
+        return extra_data
+
+    def get_missing_label_ids(self):
+        data = self.get_data_labels()
+        missing_labels = []
+        for label_id in LABELS:
+            assert label_id in data
+            if not data[label_id]:
+                missing_labels.append(label_id)
+        return missing_labels
+
+    def format_label(self, label_id):
+        """Formats string with user-facing LABEL name and its alternatives"""
+
+        assert label_id in LABEL_NAME_MAP
+        label_map = LABEL_NAME_MAP[label_id]
+        if len(label_map) == 1:
+            return label_map[0]
+        else:
+            return "%s (or %s)" % (label_map[0], " or ".join(label_map[1:]))
 
 
 class CreateContainerTask(BaseTaskHandler):
@@ -103,15 +256,30 @@ class CreateContainerTask(BaseTaskHandler):
         self._osbs = None
 
     def _download_logs(self, osbs_build_id):
-        build_log = os.path.join(self.workdir, 'build.log')
-        self.logger.debug("Getting logs from OSBS")
-        build_log_contents = self.osbs().get_build_logs(osbs_build_id)
-        self.logger.debug("Logs from OSBS retrieved")
+        file_names = []
+        fn = 'build.log'
+        build_log = os.path.join(self.workdir, fn)
+        self.logger.debug("Getting docker logs from OSBS")
+        build_log_contents = self.osbs().get_docker_build_logs(osbs_build_id)
+        self.logger.debug("Docker logs from OSBS retrieved")
         outfile = open(build_log, 'w')
         outfile.write(build_log_contents)
         outfile.close()
         self.logger.debug("Logs written to: %s" % build_log)
-        return ['build.log']
+        file_names.append(fn)
+
+        fn = 'openshift-final.log'
+        build_log = os.path.join(self.workdir, fn)
+        self.logger.debug("Getting OpenShift logs from OSBS")
+        build_log_contents = self.osbs().get_build_logs(osbs_build_id,
+                                                        follow=False)
+        self.logger.debug("Docker logs from OSBS retrieved")
+        outfile = open(build_log, 'w')
+        outfile.write(build_log_contents)
+        outfile.close()
+        file_names.append(fn)
+
+        return file_names
 
     def _get_file_url(self, source_filename):
         return "https://%s/image-export/%s/%s" % (self.osbs().os_conf.get_build_host(),
@@ -138,9 +306,15 @@ class CreateContainerTask(BaseTaskHandler):
         if isinstance(localpath, unicode):
             localpath = localpath.encode('utf-8')
             self.logger.debug("localpath changed to %r", localpath)
-        output_filename = urlgrabber.urlgrab(remote_url, filename=localpath,
-                                             ssl_verify_peer=ssl_verify_peer,
-                                             ssl_verify_host=ssl_verify_host)
+        try:
+            output_filename = urlgrabber.urlgrab(remote_url,
+                                                 filename=localpath,
+                                                 ssl_verify_peer=ssl_verify_peer,
+                                                 ssl_verify_host=ssl_verify_host)
+        except urlgrabber.grabber.URLGrabError, error:
+            self.logger.info("Failed to download file from URL %s: %s.",
+                             remote_url, error)
+            return []
         self.logger.debug("Output: %s.", output_filename)
         return [output_filename]
 
@@ -185,38 +359,61 @@ class CreateContainerTask(BaseTaskHandler):
             rpm['epoch'] = int(parts[4])
         return rpm
 
-    def handler(self, src, target_info, arch, output_template, scratch=False):
-        this_task = self.session.getTaskInfo(self.id)
-        self.logger.debug("This task: %r", this_task)
-        owner_info = self.session.getUser(this_task['owner'])
-        self.logger.debug("Started by %s", owner_info['name'])
+    def getUploadPath(self):
+        """Get the path that should be used when uploading files to
+        the hub."""
+        return koji.pathinfo.taskrelpath(self.id)
 
-        scm = My_SCM(src)
-        scm.assert_allowed(self.options.allowed_scms)
-        git_uri = scm.get_git_uri()
-        component = scm.get_component()
+    def resultdir(self):
+        return os.path.join(self.workdir, 'osbslogs')
 
-        build_response = self.osbs().create_build(
-            git_uri=git_uri,
-            git_ref=scm.revision,
-            user=owner_info['name'],
-            component=component,
-            target=target_info['name'],
-            architecture=arch,
-        )
-        build_id = build_response.build_id
-        self.logger.debug("OSBS build id: %r", build_id)
+    def _incremental_upload_logs(self, child_pid):
+        resultdir = self.resultdir()
+        uploadpath = self.getUploadPath()
+        watcher = FileWatcher(resultdir, logger=self.logger)
+        finished = False
+        try:
+            while not finished:
+                time.sleep(1)
+                status = os.waitpid(child_pid, os.WNOHANG)
+                if status[0] != 0:
+                    finished = True
 
-        self.logger.info("Waiting for osbs build_id: %s to finish.", build_id)
-        response = self.osbs().wait_for_build_to_finish(build_id)
-        self.logger.debug("OSBS build finished with status: %s. Build "
-                          "response: %s.", response.status,
-                          response.json)
-        logs = self._download_logs(build_id)
+                for result in watcher.files_to_upload():
+                    if result is False:
+                        return
+                    (fd, fname) = result
+                    kojid.incremental_upload(self.session, fname, fd,
+                                             uploadpath, logger=self.logger)
+        finally:
+            watcher.clean()
 
-        files = self._download_files(response.get_tar_metadata_filename(),
-                                     "image-%s.tar" % arch)
+    def _write_incremental_logs(self, build_id, log_filename):
+        log_basename = os.path.basename(log_filename)
+        self.logger.info("Will write follow log: %s", log_basename)
+        try:
+            build_logs = self.osbs().get_build_logs(build_id,
+                                                    follow=True)
+        except Exception, error:
+            msg = "Exception while waiting for build logs: %s" % error
+            raise ContainerError(msg)
+        outfile = open(log_filename, 'w')
+        try:
+            for line in build_logs:
+                outfile.write("%s\n" % line)
+        except Exception, error:
+            msg = "Exception (%s) while reading build logs: %s" % (type(error),
+                                                                   error)
+            raise ContainerError(msg)
+        finally:
+            outfile.close()
+        self.logger.info("%s written", log_basename)
+        build_response = self.osbs().get_build(build_id)
+        if (build_response.is_running() or build_response.is_pending()):
+            raise ContainerError("Build log finished but build still has not "
+                                 "finished: %s." % build_response.status)
 
+    def _get_rpm_packages(self, response):
         rpmlist = []
         try:
             rpm_packages = response.get_rpm_packages()
@@ -234,17 +431,147 @@ class CreateContainerTask(BaseTaskHandler):
             if not rpm_info:
                 continue
             rpmlist.append(rpm_info)
+        return rpmlist
+
+    def _get_repositories(self, response):
+        repositories = []
+        try:
+            repo_dict = response.get_repositories()
+            if repo_dict:
+                for repos in repo_dict.values():
+                    repositories.extend(repos)
+        except Exception, error:
+            self.logger.error("Failed to get available repositories from: %r. "
+                              "Reason(%s): %s",
+                              repo_dict, type(error), error)
+        return repositories
+
+    def handler(self, src, target_info, arch, output_template, scratch=False,
+                yum_repourls=None, branch=None, push_url=None):
+        if not yum_repourls:
+            yum_repourls = []
+
+        this_task = self.session.getTaskInfo(self.id)
+        self.logger.debug("This task: %r", this_task)
+        owner_info = self.session.getUser(this_task['owner'])
+        self.logger.debug("Started by %s", owner_info['name'])
+
+        scm = My_SCM(src)
+        scm.assert_allowed(self.options.allowed_scms)
+        git_uri = scm.get_git_uri()
+        component = scm.get_component()
+
+        create_build_args = {
+            'git_uri': git_uri,
+            'git_ref': scm.revision,
+            'user': owner_info['name'],
+            'component': component,
+            'target': target_info['name'],
+            'architecture': arch,
+            'yum_repourls': yum_repourls,
+        }
+        if branch:
+            create_build_args['git_branch'] = branch
+        if push_url:
+            create_build_args['git_push_url'] = push_url
+        build_response = self.osbs().create_build(
+            **create_build_args
+        )
+        build_id = build_response.get_build_name()
+        self.logger.debug("OSBS build id: %r", build_id)
+
+        self.logger.debug("Waiting for osbs build_id: %s to be scheduled.",
+                          build_id)
+        # we need to wait for kubelet to schedule the build, otherwise it's 500
+        self.osbs().wait_for_build_to_get_scheduled(build_id)
+        self.logger.debug("Build was scheduled")
+
+        osbs_logs_dir = self.resultdir()
+        koji.ensuredir(osbs_logs_dir)
+        pid = os.fork()
+        if pid:
+            self._incremental_upload_logs(pid)
+
+        else:
+            full_output_name = os.path.join(osbs_logs_dir,
+                                            'openshift-incremental.log')
+
+            # Make sure curl is initialized again otherwise connections via SSL
+            # fails with NSS error -8023 and curl_multi.info_read()
+            # returns error code 35 (SSL CONNECT failed).
+            # See http://permalink.gmane.org/gmane.comp.web.curl.library/38759
+            self._osbs = None
+            self.logger.debug("Running pycurl global cleanup")
+            pycurl.global_cleanup()
+
+            # Following retry code is here mainly to workaround bug which causes
+            # connection drop while reading logs after about 5 minutes.
+            # OpenShift bug with description:
+            # https://github.com/openshift/origin/issues/2348
+            # and upstream bug in Kubernetes:
+            # https://github.com/GoogleCloudPlatform/kubernetes/issues/9013
+            retry = 0
+            max_retries = 30
+            while retry < max_retries:
+                try:
+                    self._write_incremental_logs(build_id,
+                                                 full_output_name)
+                except Exception, error:
+                    self.logger.info("Error while saving incremental logs "
+                                     "(retry #%d): %s", retry, error)
+                    retry += 1
+                    time.sleep(10)
+                    continue
+                break
+            else:
+                self.logger.info("Gave up trying to save incremental logs "
+                                 "after #%d retries.", retry)
+                os._exit(1)
+            os._exit(0)
+
+        response = self.osbs().wait_for_build_to_finish(build_id)
+        self.logger.debug("OSBS build finished with status: %s. Build "
+                          "response: %s.", response.status,
+                          response.json)
+        logs = self._download_logs(build_id)
+
+        self.logger.info("Response status: %r", response.is_succeeded())
+
+        files = []
+        if response.is_succeeded() and response.get_tar_metadata_filename():
+            files = self._download_files(response.get_tar_metadata_filename(),
+                                         "image-%s.tar" % arch)
+
+        rpmlist = []
+        if response.is_succeeded():
+            rpmlist = self._get_rpm_packages(response)
+
+        self.logger.debug("rpm list:")
+        for rpm in rpmlist:
+            self.logger.debug("%(name)s-%(version)s-%(release)s.%(arch)s.rpm" %
+                              rpm)
 
         repo_info = self.session.getRepo(target_info['build_tag'])
         # TODO: copied from image build
         # TODO: hack to make this work for now, need to refactor
-        if scratch:
-            br = kojid.BuildRoot(self.session, self.options,
-                                 target_info['build_tag'], arch,
-                                 self.id, repo_id=repo_info['id'])
-            br.markExternalRPMs(rpmlist)
-            # TODO: I'm not sure if this is ok
-            br.expire()
+        if not scratch:
+            try:
+                br = kojid.BuildRoot(self.session, self.options,
+                                     target_info['build_tag'], arch,
+                                     self.id, repo_id=repo_info['id'])
+                br.markExternalRPMs(rpmlist)
+                # TODO: I'm not sure if this is ok
+                br.expire()
+            except Exception, error:
+                raise koji.PostBuildError("Failed to distuinguish external "
+                                          "rpms: %s" % error)
+
+        repositories = []
+        if response.is_succeeded():
+            repositories = self._get_repositories(response)
+
+        self.logger.info("Image available in the following repositories: %r",
+                         repositories)
 
         containerdata = {
             'arch': arch,
@@ -253,6 +580,7 @@ class CreateContainerTask(BaseTaskHandler):
             'osbs_build_id': build_id,
             'rpmlist': rpmlist,
             'files': [],
+            'repositories': repositories
         }
 
         # upload the build output
@@ -260,13 +588,14 @@ class CreateContainerTask(BaseTaskHandler):
             build_log = os.path.join(self.workdir, filename)
             self.uploadFile(build_log)
 
-        if len(files) != 1:
-            raise ContainerError("There should be only one container file but "
-                                 "it isn't(%d): %s" % len(files), files)
-        for filename in files:
-            full_path = os.path.join(self.workdir, filename)
-            self.uploadFile(full_path, remoteName=output_template)
-            containerdata['files'].append(os.path.basename(output_template))
+        if response.is_succeeded() and len(files) != 1:
+            self.logger.error("There should be only one container file but "
+                              "there are %d: %s", len(files), files)
+        else:
+            for filename in files:
+                full_path = os.path.join(self.workdir, filename)
+                self.uploadFile(full_path, remoteName=output_template)
+                containerdata['files'].append(os.path.basename(output_template))
 
         return containerdata
 
@@ -306,7 +635,7 @@ class BuildContainerTask(BaseTaskHandler):
             raise koji.BuildError("package (container)  %s is blocked for tag %s" % (name, target_info['dest_tag_name']))
 
     def runBuilds(self, src, target_info, arches, output_template,
-                  scratch=False):
+                  scratch=False, yum_repourls=None, branch=None, push_url=None):
         subtasks = {}
         for arch in arches:
             subtasks[arch] = self.session.host.subtask(method='createContainer',
@@ -314,7 +643,10 @@ class BuildContainerTask(BaseTaskHandler):
                                                                 target_info,
                                                                 arch,
                                                                 output_template,
-                                                                scratch],
+                                                                scratch,
+                                                                yum_repourls,
+                                                                branch,
+                                                                push_url],
                                                        label='container',
                                                        parent=self.id)
         self.logger.debug("Got image subtasks: %r", (subtasks))
@@ -403,23 +735,16 @@ class BuildContainerTask(BaseTaskHandler):
         It differs from get_header_fields() which is ran on rpms that missing
         fields are not considered to be error.
         """
-        parser = DockerfileParser(dockerfile_path, logger=self.logger)
-        labels = parser.get_labels()
+        dockerfile_parse.parser.logger = logging.getLogger("%s.dockerfile_parse"
+                                                           % self.logger.name)
+        parser = dockerfile_parse.parser.DockerfileParser(dockerfile_path)
         ret = {}
         for f in fields:
             try:
-                ret[f] = labels[f]
+                ret[f] = parser.labels[f]
             except KeyError:
                 self.logger.info("No such label: %s", f)
         return ret
-
-    def _map_labels_to_data(self, labels):
-        data = {}
-        for key, value in labels.items():
-            if key in LABEL_MAP:
-                key = LABEL_MAP[key]
-            data[key] = value
-        return data
 
     def handler(self, src, target, opts=None):
         if not opts:
@@ -433,16 +758,18 @@ class BuildContainerTask(BaseTaskHandler):
         archlist = self.getArchList(build_tag)
 
         dockerfile_path = self.fetchDockerfile(src)
-        data_labels = self._get_dockerfile_labels(dockerfile_path, LABELS)
-        data = self._map_labels_to_data(data_labels)
-
+        labels_wrapper = LabelsWrapper(dockerfile_path, self.logger.name)
+        missing_labels = labels_wrapper.get_missing_label_ids()
+        if missing_labels:
+            formatted_labels_list = [labels_wrapper.format_label(label_id) for
+                                     label_id in missing_labels]
+            msg_template = ("Required LABELs haven't been found in "
+                            "Dockerfile: %s.")
+            raise koji.BuildError, (msg_template %
+                                    ', '.join(formatted_labels_list))
+        data = labels_wrapper.get_extra_data()
         admin_opts = self._get_admin_opts(opts)
         data.update(admin_opts)
-
-        for field in ['name', 'version', 'release', 'architecture']:
-            if field not in data:
-                raise koji.BuildError('%s needs to be specified for '
-                                      'container builds' % field)
 
         # scratch builds do not get imported
         if not self.opts.get('scratch'):
@@ -458,13 +785,24 @@ class BuildContainerTask(BaseTaskHandler):
             output_template = self._getOutputImageTemplate(**data)
             results = self.runBuilds(src, target_info, archlist,
                                      output_template,
-                                     opts.get('scratch', False))
+                                     opts.get('scratch', False),
+                                     opts.get('yum_repourls', None),
+                                     opts.get('git_branch', None),
+                                     opts.get('push_url', None))
             results_xmlrpc = {}
             for task_id, result in results.items():
                 # get around an xmlrpc limitation, use arches for keys instead
                 results_xmlrpc[str(task_id)] = result
+            all_repositories = []
             for result in results.values():
                 self._raise_if_image_failed(result['osbs_build_id'])
+                try:
+                    repository = result.get('repositories')
+                    all_repositories.extend(repository)
+                except Exception, error:
+                    self.logger.error("Failed to merge list of repositories "
+                                      "%r. Reason (%s): %s", repository,
+                                      type(error), error)
             if opts.get('scratch'):
                 # scratch builds do not get imported
                 self.session.host.moveImageBuildToScratch(self.id,
@@ -495,125 +833,12 @@ class BuildContainerTask(BaseTaskHandler):
                 arch='noarch')
             self.wait(tag_task_id)
 
+        report = ('Image available in following repositories:\n%s' %
+                  '\n'.join(all_repositories))
+        return report
+
     def _raise_if_image_failed(self, osbs_build_id):
         build = self.osbs().get_build(osbs_build_id)
         if build.is_failed():
-            raise ContainerError('Image build failed')
-
-
-# Stolen from dock to not introduce new require. Replace with separate module
-# after it is available: https://github.com/DBuildService/dock/issues/149
-# Originally BSD licensed.
-class DockerfileParser(object):
-    def __init__(self, git_path, path='', logger=None):
-        if git_path.endswith(DOCKERFILE_FILENAME):
-            self.dockerfile_path = git_path
-        else:
-            if path.endswith(DOCKERFILE_FILENAME):
-                self.dockerfile_path = os.path.join(git_path, path)
-            else:
-                self.dockerfile_path = os.path.join(git_path, path, DOCKERFILE_FILENAME)
-        if logger:
-            self.logger = logger
-        else:
-            self.logger = logging.getLogger(__name__)
-
-    @staticmethod
-    def b2u(string):
-        """ bytes to unicode """
-        if isinstance(string, bytes):
-            return string.decode('utf-8')
-        return string
-
-    @staticmethod
-    def u2b(string):
-        """ unicode to bytes (Python 2 only) """
-        if PY2 and isinstance(string, unicode):
-            return string.encode('utf-8')
-        return string
-
-    @property
-    def lines(self):
-        try:
-            with open(self.dockerfile_path, 'r') as dockerfile:
-                return [self.b2u(l) for l in dockerfile.readlines()]
-        except (IOError, OSError) as ex:
-            self.logger.error("Couldn't retrieve lines from dockerfile: %s" % repr(ex))
-            raise
-
-    @lines.setter
-    def lines(self, lines):
-        try:
-            with open(self.dockerfile_path, 'w') as dockerfile:
-                dockerfile.writelines([self.u2b(l) for l in lines])
-        except (IOError, OSError) as ex:
-            self.logger.error("Couldn't write lines to dockerfile: %s" % repr(ex))
-            raise
-
-    @property
-    def content(self):
-        try:
-            with open(self.dockerfile_path, 'r') as dockerfile:
-                return self.b2u(dockerfile.read())
-        except (IOError, OSError) as ex:
-            self.logger.error("Couldn't retrieve content of dockerfile: %s" % repr(ex))
-            raise
-
-    @content.setter
-    def content(self, content):
-        try:
-            with open(self.dockerfile_path, 'w') as dockerfile:
-                dockerfile.write(self.u2b(content))
-        except (IOError, OSError) as ex:
-            self.logger.error("Couldn't write content to dockerfile: %s" % repr(ex))
-            raise
-
-    def get_baseimage(self):
-        for line in self.lines:
-            if line.startswith("FROM"):
-                return line.split()[1]
-
-    def _split(self, string):
-        if PY2 and isinstance(string, unicode):
-            # Python2's shlex doesn't like unicode
-            string = self.u2b(string)
-            splits = shlex.split(string)
-            return map(self.b2u, splits)
-        else:
-            return shlex.split(string)
-
-    def get_labels(self):
-        """ opposite of AddLabelsPlugin, i.e. return dict of labels from dockerfile
-        :return: dictionary of label:value or label:'' if there's no value
-        """
-        labels = {}
-        multiline = False
-        processed_instr = ""
-        for line in self.lines:
-            line = line.rstrip()  # docker does this
-            self.logger.debug("processing line %s", repr(line))
-            if multiline:
-                processed_instr += line
-                if line.endswith("\\"):  # does multiline continue?
-                    # docker strips single \
-                    processed_instr = processed_instr[:-1]
-                    continue
-                else:
-                    multiline = False
-            else:
-                processed_instr = line
-            if processed_instr.startswith("LABEL"):
-                if processed_instr.endswith("\\"):
-                    self.logger.debug("multiline LABEL")
-                    # docker strips single \
-                    processed_instr = processed_instr[:-1]
-                    multiline = True
-                    continue
-                for token in self._split(processed_instr[len("LABEL "):]):
-                    key_val = token.split("=", 1)
-                    if len(key_val) == 2:
-                        labels[key_val[0]] = key_val[1]
-                    else:
-                        labels[key_val[0]] = ''
-                    self.logger.debug("new label %s=%s", repr(key_val[0]), repr(labels[key_val[0]]))
-        return labels
+            raise ContainerError('Image build failed. OSBS build id: %s' %
+                                 osbs_build_id)
