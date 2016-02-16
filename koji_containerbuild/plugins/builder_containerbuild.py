@@ -33,6 +33,7 @@ import urlgrabber
 import urlgrabber.grabber
 import dockerfile_parse
 import pycurl
+import re
 
 import koji
 from koji.daemon import SCM
@@ -446,6 +447,23 @@ class CreateContainerTask(BaseTaskHandler):
                               repo_dict, type(error), error)
         return repositories
 
+    def _get_digests(self, response):
+        digests = []
+        #digests = response['annotations']['digests']
+        
+        digests = response.get_digests()
+
+        for d in digests:
+            if re.search("(\A[^-]+\.[^-]+\-[^-]+\Z)", d['tag']):
+                repo = d
+        
+        repository = []
+        repository.append( "%s/%s:%s" % (repo['registry'],repo['repository'],repo['tag']))
+        repository.append( "%s/%s@%s" % (repo['registry'],repo['repository'],repo['digest']))
+        digests = repository
+
+        return digests
+
     def handler(self, src, target_info, arch, output_template, scratch=False,
                 yum_repourls=None, branch=None, push_url=None):
         if not yum_repourls:
@@ -570,6 +588,10 @@ class CreateContainerTask(BaseTaskHandler):
         if response.is_succeeded():
             repositories = self._get_repositories(response)
 
+        digests = []
+        if response.is_succeeded():
+            digests = self._get_digests(response)
+
         self.logger.info("Image available in the following repositories: %r",
                          repositories)
 
@@ -580,7 +602,8 @@ class CreateContainerTask(BaseTaskHandler):
             'osbs_build_id': build_id,
             'rpmlist': rpmlist,
             'files': [],
-            'repositories': repositories
+            'repositories': repositories,
+            'digests': digests
         }
 
         # upload the build output
@@ -596,6 +619,8 @@ class CreateContainerTask(BaseTaskHandler):
                 full_path = os.path.join(self.workdir, filename)
                 self.uploadFile(full_path, remoteName=output_template)
                 containerdata['files'].append(os.path.basename(output_template))
+
+        self.extra_information = containerdata        
 
         return containerdata
 
@@ -777,9 +802,11 @@ class BuildContainerTask(BaseTaskHandler):
             if not opts.get('skip_tag'):
                 self.check_whitelist(data['name'], target_info)
             bld_info = self.session.host.initImageBuild(self.id, data)
+            self.logger.info("Build Info : %s", bld_info)
         try:
             self.extra_information = {"src": src, "data": data,
                                       "target": target}
+            self.logger.info("extra information: %s", self.extra_information)
             if not SCM.is_scm_url(src):
                 raise koji.BuildError('Invalid source specification: %s' % src)
             output_template = self._getOutputImageTemplate(**data)
@@ -794,11 +821,14 @@ class BuildContainerTask(BaseTaskHandler):
                 # get around an xmlrpc limitation, use arches for keys instead
                 results_xmlrpc[str(task_id)] = result
             all_repositories = []
+            all_digests = []
             for result in results.values():
                 self._raise_if_image_failed(result['osbs_build_id'])
                 try:
                     repository = result.get('repositories')
                     all_repositories.extend(repository)
+                    digest = result.get('digests')
+                    all_digests.extend(digest)
                 except Exception, error:
                     self.logger.error("Failed to merge list of repositories "
                                       "%r. Reason (%s): %s", repository,
@@ -834,7 +864,7 @@ class BuildContainerTask(BaseTaskHandler):
             self.wait(tag_task_id)
 
         report = ('Image available in following repositories:\n%s' %
-                  '\n'.join(all_repositories))
+                  '\n'.join(all_digests))
         return report
 
     def _raise_if_image_failed(self, osbs_build_id):
